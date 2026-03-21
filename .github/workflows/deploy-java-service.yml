@@ -14,23 +14,23 @@ on:
         required: false
         type: string
         default: '512m'
+      container_port:
+        required: false
+        type: number
+        default: 8080
     secrets:
-      EC2_HOST:
-        required: true
-      EC2_USER:
-        required: true
-      EC2_SSH_KEY:
-        required: true
       GH_PACKAGES_TOKEN:
         required: true
 
 permissions:
+  id-token: write
   contents: read
-  packages: write
+  packages: read
 
 env:
-  REGISTRY: ghcr.io
-  ORG: management-system-for-rental-sep490
+  AWS_REGION: ap-southeast-1
+  ECR_REGISTRY: 886350084162.dkr.ecr.ap-southeast-1.amazonaws.com
+  ECS_CLUSTER: isums-cluster
 
 jobs:
   build-and-deploy:
@@ -64,17 +64,20 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
           GITHUB_ACTOR: ${{ github.actor }}
 
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build & Push image ARM64
+      - name: Build & Push image to ECR (ARM64)
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -83,30 +86,40 @@ jobs:
           build-args: |
             XMX=${{ inputs.xmx }}
           tags: |
-            ${{ env.REGISTRY }}/${{ env.ORG }}/${{ inputs.service_name }}:latest
-            ${{ env.REGISTRY }}/${{ env.ORG }}/${{ inputs.service_name }}:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/isums/${{ inputs.service_name }}:latest
+            ${{ env.ECR_REGISTRY }}/isums/${{ inputs.service_name }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Deploy on EC2
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Download existing task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ inputs.service_name }} \
+            --query taskDefinition \
+            --output json > task-def.json
+          echo "Task definition downloaded"
+
+      - name: Update image in task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            echo "--- Pulling ${{ inputs.service_name }} ---"
-            docker pull ${{ env.REGISTRY }}/${{ env.ORG }}/${{ inputs.service_name }}:latest
+          task-definition: task-def.json
+          container-name: ${{ inputs.service_name }}
+          image: ${{ env.ECR_REGISTRY }}/isums/${{ inputs.service_name }}:${{ github.sha }}
 
-            echo "--- Restarting ${{ inputs.service_name }} ---"
-            cd ~/isums
-            docker-compose up -d --no-deps --force-recreate ${{ inputs.service_name }}
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ inputs.service_name }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
 
-            echo "--- Cleaning old images ---"
-            docker image prune -f
-
-            echo "--- Health check ---"
-            sleep 10
-            docker ps --filter "name=${{ inputs.service_name }}" --format "{{.Names}} | {{.Status}}"
-
-            echo "${{ inputs.service_name }} deployed at $(date)"
+      - name: Verify deployment
+        run: |
+          echo "${{ inputs.service_name }} deployed successfully at $(date)"
+          aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ inputs.service_name }} \
+            --query 'services[0].{Status:status,Running:runningCount,Desired:desiredCount}' \
+            --output table
