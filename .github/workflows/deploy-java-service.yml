@@ -21,7 +21,7 @@ on:
         required: true
       EC2_SSH_KEY:
         required: true
-      GITHUB_TOKEN:
+      GH_PACKAGES_TOKEN:
         required: true
 
 permissions:
@@ -61,7 +61,7 @@ jobs:
       - name: Build JAR
         run: ./gradlew bootJar -x test --no-daemon
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
           GITHUB_ACTOR: ${{ github.actor }}
 
       - name: Set up Docker Buildx
