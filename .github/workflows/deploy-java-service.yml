@@ -1,0 +1,107 @@
+name: Reusable Deploy Java Service
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        required: true
+        type: string
+      java_version:
+        required: false
+        type: string
+        default: '25'
+      xmx:
+        required: false
+        type: string
+        default: '512m'
+    secrets:
+      EC2_HOST:
+        required: true
+      EC2_USER:
+        required: true
+      EC2_SSH_KEY:
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  ORG: management-system-for-rental-sep490
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: 'corretto'
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build JAR
+        run: ./gradlew bootJar -x test --no-daemon
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & Push image ARM64
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          build-args: |
+            XMX=${{ inputs.xmx }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.ORG }}/${{ inputs.service_name }}:latest
+            ${{ env.REGISTRY }}/${{ env.ORG }}/${{ inputs.service_name }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy on EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            echo "--- Pulling ${{ inputs.service_name }} ---"
+            docker pull ${{ env.REGISTRY }}/${{ env.ORG }}/${{ inputs.service_name }}:latest
+
+            echo "--- Restarting ${{ inputs.service_name }} ---"
+            cd ~/isums
+            docker-compose up -d --no-deps --force-recreate ${{ inputs.service_name }}
+
+            echo "--- Cleaning old images ---"
+            docker image prune -f
+
+            echo "--- Health check ---"
+            sleep 10
+            docker ps --filter "name=${{ inputs.service_name }}" --format "{{.Names}} | {{.Status}}"
+
+            echo "${{ inputs.service_name }} deployed at $(date)"
