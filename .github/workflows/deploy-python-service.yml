@@ -28,10 +28,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -41,9 +41,7 @@ jobs:
 
       - name: Lint with flake8
         run: |
-          # Stop build if syntax errors or undefined names
           flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-          # Warnings only (won't fail build)
           flake8 . --count --exit-zero --max-complexity=10 --max-line-length=120 --statistics
 
       - name: Validate Dockerfile
@@ -64,7 +62,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -173,7 +171,7 @@ jobs:
 
     steps:
       - name: Delete stale caches older than 3 days
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const caches = await github.rest.actions.getActionsCacheList({
