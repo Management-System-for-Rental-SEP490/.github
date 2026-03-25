@@ -1,0 +1,89 @@
+name: Reusable Deploy Python Service
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        required: true
+        type: string
+      python_version:
+        required: false
+        type: string
+        default: '3.11'
+      container_port:
+        required: false
+        type: number
+        default: 9000
+    secrets:
+      AWS_ROLE_ARN:
+        required: false
+permissions:
+  id-token: write
+  contents: read
+env:
+  AWS_REGION: ap-southeast-1
+  ECR_REGISTRY: 886350084162.dkr.ecr.ap-southeast-1.amazonaws.com
+  ECS_CLUSTER: isums-cluster
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & Push image to ECR (AMD64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/isums/${{ inputs.service_name }}:latest
+            ${{ env.ECR_REGISTRY }}/isums/${{ inputs.service_name }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Download existing task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ inputs.service_name }} \
+            --query taskDefinition \
+            --output json > task-def.json
+          echo "Task definition downloaded"
+
+      - name: Update image in task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def.json
+          container-name: ${{ inputs.service_name }}
+          image: ${{ env.ECR_REGISTRY }}/isums/${{ inputs.service_name }}:${{ github.sha }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ inputs.service_name }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Verify deployment
+        run: |
+          echo "${{ inputs.service_name }} deployed successfully at $(date)"
+          aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ inputs.service_name }} \
+            --query 'services[0].{Status:status,Running:runningCount,Desired:desiredCount}' \
+            --output table
