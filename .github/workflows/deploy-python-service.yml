@@ -9,6 +9,10 @@ on:
         required: false
         type: number
         default: 9000
+      service_discovery_arn:
+        required: false
+        type: string
+        default: ''
 
 permissions:
   id-token: write
@@ -121,11 +125,20 @@ jobs:
     environment: production
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Register task definition if not exists
+        run: |
+          aws ecs describe-task-definition --task-definition ${{ inputs.service_name }} \
+          || aws ecs register-task-definition \
+              --cli-input-json file://task-definition.json
 
       - name: Download existing task definition
         run: |
@@ -142,6 +155,34 @@ jobs:
           task-definition: task-def.json
           container-name: ${{ inputs.service_name }}
           image: ${{ needs.build.outputs.image }}
+
+      - name: Create ECS service if not exists
+        run: |
+          SERVICE_EXISTS=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ inputs.service_name }} \
+            --query 'services[?status==`ACTIVE`].serviceName' \
+            --output text)
+
+          if [ -z "$SERVICE_EXISTS" ]; then
+            echo "Creating new ECS service with service discovery..."
+            REGISTRY_ARG=""
+            if [ -n "${{ inputs.service_discovery_arn }}" ]; then
+              REGISTRY_ARG="--service-registries registryArn=${{ inputs.service_discovery_arn }},containerName=${{ inputs.service_name }},containerPort=${{ inputs.container_port }}"
+            fi
+
+            aws ecs create-service \
+              --cluster ${{ env.ECS_CLUSTER }} \
+              --service-name ${{ inputs.service_name }} \
+              --task-definition ${{ inputs.service_name }} \
+              --desired-count 1 \
+              --launch-type EC2 \
+              --scheduling-strategy REPLICA \
+              $REGISTRY_ARG
+            echo "ECS service created"
+          else
+            echo "ECS service already exists, skipping creation"
+          fi
 
       - name: Deploy to ECS
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
