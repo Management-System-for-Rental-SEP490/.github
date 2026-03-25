@@ -5,27 +5,63 @@ on:
       service_name:
         required: true
         type: string
-      python_version:
-        required: false
-        type: string
-        default: '3.11'
       container_port:
         required: false
         type: number
         default: 9000
-    secrets:
-      AWS_ROLE_ARN:
-        required: false
+
 permissions:
   id-token: write
   contents: read
+
 env:
   AWS_REGION: ap-southeast-1
   ECR_REGISTRY: 886350084162.dkr.ecr.ap-southeast-1.amazonaws.com
   ECS_CLUSTER: isums-cluster
+
 jobs:
-  build-and-deploy:
+  # ─────────────────────────────────────────────
+  # JOB 1: Lint & Validate
+  # ─────────────────────────────────────────────
+  lint:
+    name: Lint & Validate
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install lint tools
+        run: pip install flake8
+
+      - name: Lint with flake8
+        run: |
+          # Stop build if syntax errors or undefined names
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Warnings only (won't fail build)
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=120 --statistics
+
+      - name: Validate Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: error
+
+  # ─────────────────────────────────────────────
+  # JOB 2: Build & Push to ECR
+  # ─────────────────────────────────────────────
+  build:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    needs: lint
+    outputs:
+      image: ${{ steps.image-tag.outputs.image }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,6 +76,11 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Set image tag output
+        id: image-tag
+        run: |
+          echo "image=${{ env.ECR_REGISTRY }}/isums/${{ inputs.service_name }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -52,8 +93,41 @@ jobs:
           tags: |
             ${{ env.ECR_REGISTRY }}/isums/${{ inputs.service_name }}:latest
             ${{ env.ECR_REGISTRY }}/isums/${{ inputs.service_name }}:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ inputs.service_name }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.service_name }}
+
+      - name: Delete untagged ECR images
+        run: |
+          IMAGE_IDS=$(aws ecr list-images \
+            --repository-name isums/${{ inputs.service_name }} \
+            --filter tagStatus=UNTAGGED \
+            --query 'imageIds[*]' \
+            --output json)
+
+          if [ "$IMAGE_IDS" != "[]" ] && [ -n "$IMAGE_IDS" ]; then
+            aws ecr batch-delete-image \
+              --repository-name isums/${{ inputs.service_name }} \
+              --image-ids "$IMAGE_IDS"
+            echo "Cleaned up untagged images"
+          else
+            echo "No untagged images to clean"
+          fi
+
+  # ─────────────────────────────────────────────
+  # JOB 3: Deploy to ECS
+  # ─────────────────────────────────────────────
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: build
+    environment: production
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Download existing task definition
         run: |
@@ -69,7 +143,7 @@ jobs:
         with:
           task-definition: task-def.json
           container-name: ${{ inputs.service_name }}
-          image: ${{ env.ECR_REGISTRY }}/isums/${{ inputs.service_name }}:${{ github.sha }}
+          image: ${{ needs.build.outputs.image }}
 
       - name: Deploy to ECS
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
@@ -81,9 +155,43 @@ jobs:
 
       - name: Verify deployment
         run: |
-          echo "${{ inputs.service_name }} deployed successfully at $(date)"
+          echo "✅ ${{ inputs.service_name }} deployed successfully at $(date)"
           aws ecs describe-services \
             --cluster ${{ env.ECS_CLUSTER }} \
             --services ${{ inputs.service_name }} \
             --query 'services[0].{Status:status,Running:runningCount,Desired:desiredCount}' \
             --output table
+
+  # ─────────────────────────────────────────────
+  # JOB 4: Cleanup old GHA cache
+  # ─────────────────────────────────────────────
+  cleanup:
+    name: Cleanup old GHA cache
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: always()
+
+    steps:
+      - name: Delete stale caches older than 3 days
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const caches = await github.rest.actions.getActionsCacheList({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+
+            const threeDaysAgo = new Date();
+            threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
+
+            for (const cache of caches.data.actions_caches) {
+              const lastAccessed = new Date(cache.last_accessed_at);
+              if (lastAccessed < threeDaysAgo) {
+                await github.rest.actions.deleteActionsCacheById({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  cache_id: cache.id,
+                });
+                console.log(`Deleted cache: ${cache.key} (last accessed: ${cache.last_accessed_at})`);
+              }
+            }
