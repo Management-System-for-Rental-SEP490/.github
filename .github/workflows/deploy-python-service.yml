@@ -9,10 +9,6 @@ on:
         required: false
         type: number
         default: 9000
-      service_discovery_arn:
-        required: false
-        type: string
-        default: ''
 
 permissions:
   id-token: write
@@ -136,9 +132,8 @@ jobs:
 
       - name: Register task definition if not exists
         run: |
-          aws ecs describe-task-definition --task-definition ${{ inputs.service_name }} \
-          || aws ecs register-task-definition \
-              --cli-input-json file://task-definition.json
+          aws ecs describe-task-definition --task-definition ${{ inputs.service_name }} 2>/dev/null \
+          || aws ecs register-task-definition --cli-input-json file://task-definition.json
 
       - name: Download existing task definition
         run: |
@@ -146,7 +141,6 @@ jobs:
             --task-definition ${{ inputs.service_name }} \
             --query taskDefinition \
             --output json > task-def.json
-          echo "Task definition downloaded"
 
       - name: Update image in task definition
         id: task-def
@@ -165,20 +159,14 @@ jobs:
             --output text)
 
           if [ -z "$SERVICE_EXISTS" ]; then
-            echo "Creating new ECS service with service discovery..."
-            REGISTRY_ARG=""
-            if [ -n "${{ inputs.service_discovery_arn }}" ]; then
-              REGISTRY_ARG="--service-registries registryArn=${{ inputs.service_discovery_arn }},containerName=${{ inputs.service_name }},containerPort=${{ inputs.container_port }}"
-            fi
-
+            echo "Creating new ECS service..."
             aws ecs create-service \
               --cluster ${{ env.ECS_CLUSTER }} \
               --service-name ${{ inputs.service_name }} \
               --task-definition ${{ inputs.service_name }} \
               --desired-count 1 \
               --launch-type EC2 \
-              --scheduling-strategy REPLICA \
-              $REGISTRY_ARG
+              --deployment-configuration "deploymentCircuitBreaker={enable=true,rollback=true},maximumPercent=200,minimumHealthyPercent=100"
             echo "ECS service created"
           else
             echo "ECS service already exists, skipping creation"
