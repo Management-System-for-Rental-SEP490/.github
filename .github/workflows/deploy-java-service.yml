@@ -17,6 +17,10 @@ on:
         required: false
         type: number
         default: 8080
+      service_connect_services:
+        required: false
+        type: string
+        default: ''
     secrets:
       GH_PACKAGES_TOKEN:
         required: true
@@ -182,6 +186,30 @@ jobs:
           cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
 
+      - name: Update Service Connect configuration
+        run: |
+          if [ -n "${{ inputs.service_connect_services }}" ]; then
+            # Server mode - has gRPC or HTTP ports to expose
+            SERVICE_CONNECT_CONFIG=$(cat <<EOF
+          {
+            "enabled": true,
+            "namespace": "isums.local",
+            "services": ${{ inputs.service_connect_services }}
+          }
+          EOF
+            )
+          else
+            # Client only mode
+            SERVICE_CONNECT_CONFIG='{"enabled": true, "namespace": "isums.local"}'
+          fi
+
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ inputs.service_name }} \
+            --service-connect-configuration "$SERVICE_CONNECT_CONFIG"
+
+          echo "✅ Service Connect updated for ${{ inputs.service_name }}"
+
       - name: Verify deployment
         run: |
           echo "✅ ${{ inputs.service_name }} deployed successfully at $(date)"
@@ -199,6 +227,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: deploy
     if: always()
+    permissions:
+      actions: write
+      contents: read
 
     steps:
       - name: Delete stale caches older than 3 days
