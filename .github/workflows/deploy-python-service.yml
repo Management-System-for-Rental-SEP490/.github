@@ -153,7 +153,7 @@ jobs:
           aws ecr describe-images \
             --repository-name "$repo" \
             --filter tagStatus=TAGGED \
-            --query 'sort_by(imageDetails,& imagePushedAt)[].{digest:imageDigest,tags:imageTags,pushed:imagePushedAt}' \
+            --query 'sort_by(imageDetails,&imagePushedAt)[].{digest:imageDigest,tags:imageTags,pushed:imagePushedAt}' \
             --output json > images.json
 
           jq -r --argjson keep "$keep" '
