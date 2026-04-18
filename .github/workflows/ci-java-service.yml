@@ -1,0 +1,48 @@
+name: Reusable Java CI
+
+on:
+  workflow_call:
+    inputs:
+      java_version:
+        required: false
+        type: string
+        default: '25'
+      gradle_task:
+        required: false
+        type: string
+        default: 'clean build -x test'
+      runner:
+        required: false
+        type: string
+        default: ubuntu-latest
+    secrets:
+      GH_PACKAGES_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  ci:
+    name: Java CI
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: corretto
+          cache: gradle
+
+      - name: Grant Gradle wrapper permission
+        run: chmod +x gradlew
+
+      - name: Run Gradle checks
+        run: ./gradlew ${{ inputs.gradle_task }} --no-daemon
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
