@@ -1,4 +1,5 @@
 name: Reusable Deploy Java Service
+
 on:
   workflow_call:
     inputs:
@@ -13,14 +14,38 @@ on:
         required: false
         type: string
         default: '512m'
-      container_port:
-        required: false
-        type: number
-        default: 8080
-      service_connect_services:
+      ecr_repository:
         required: false
         type: string
         default: ''
+      ecs_cluster:
+        required: false
+        type: string
+        default: isums-cluster
+      task_definition:
+        required: false
+        type: string
+        default: ''
+      container_name:
+        required: false
+        type: string
+        default: ''
+      build_runner:
+        required: false
+        type: string
+        default: ubuntu-latest
+      image_runner:
+        required: false
+        type: string
+        default: ubuntu-24.04-arm
+      wait_for_service_stability:
+        required: false
+        type: boolean
+        default: true
+      ecr_keep_tagged:
+        required: false
+        type: number
+        default: 8
     secrets:
       GH_PACKAGES_TOKEN:
         required: true
@@ -33,225 +58,187 @@ permissions:
 env:
   AWS_REGION: ap-southeast-1
   ECR_REGISTRY: 886350084162.dkr.ecr.ap-southeast-1.amazonaws.com
-  ECS_CLUSTER: isums-cluster
+
+concurrency:
+  group: deploy-${{ inputs.service_name }}-${{ github.ref_name }}
+  cancel-in-progress: true
 
 jobs:
-  # ─────────────────────────────────────────────
-  # JOB 1: Build JAR
-  # ─────────────────────────────────────────────
   build-jar:
     name: Build JAR
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.build_runner }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Set up JDK
         uses: actions/setup-java@v5
         with:
           java-version: ${{ inputs.java_version }}
-          distribution: 'corretto'
+          distribution: corretto
+          cache: gradle
 
-      - name: Cache Gradle
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}-v2
-          restore-keys: gradle-${{ runner.os }}-
-
-      - name: Grant execute permission for gradlew
+      - name: Grant Gradle wrapper permission
         run: chmod +x gradlew
 
-      - name: Build JAR
+      - name: Build boot JAR
         run: ./gradlew bootJar -x test --no-daemon
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
           GITHUB_ACTOR: ${{ github.actor }}
 
       - name: Upload JAR artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
-          name: app-jar-${{ github.sha }}
+          name: app-jar-${{ github.run_id }}-${{ github.sha }}
           path: build/libs/*.jar
+          if-no-files-found: error
           retention-days: 1
 
-  # ─────────────────────────────────────────────
-  # JOB 2: Build & Push Docker image to ECR
-  # ─────────────────────────────────────────────
   build-image:
-    name: Build & Push Image
-    runs-on: ubuntu-latest
+    name: Build ARM64 Image
+    runs-on: ${{ inputs.image_runner }}
     needs: build-jar
     outputs:
-      image: ${{ steps.image-tag.outputs.image }}
-
+      image: ${{ steps.meta.outputs.image }}
+      repository: ${{ steps.meta.outputs.repository }}
+      task-definition: ${{ steps.meta.outputs.task_definition }}
+      container-name: ${{ steps.meta.outputs.container_name }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Download JAR artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v7
         with:
-          name: app-jar-${{ github.sha }}
+          name: app-jar-${{ github.run_id }}-${{ github.sha }}
           path: build/libs/
 
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Resolve deployment metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo="${{ inputs.ecr_repository }}"
+          task_def="${{ inputs.task_definition }}"
+          container="${{ inputs.container_name }}"
+
+          if [ -z "$repo" ]; then repo="isums/${{ inputs.service_name }}"; fi
+          if [ -z "$task_def" ]; then task_def="${{ inputs.service_name }}"; fi
+          if [ -z "$container" ]; then container="${{ inputs.service_name }}"; fi
+
+          echo "repository=$repo" >> "$GITHUB_OUTPUT"
+          echo "task_definition=$task_def" >> "$GITHUB_OUTPUT"
+          echo "container_name=$container" >> "$GITHUB_OUTPUT"
+          echo "image=${{ env.ECR_REGISTRY }}/$repo:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Set image tag output
-        id: image-tag
-        run: |
-          echo "image=${{ env.ECR_REGISTRY }}/isums/${{ inputs.service_name }}:${{ github.sha }}" >> $GITHUB_OUTPUT
-
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
-      - name: Build & Push image to ECR (ARM64)
-        uses: docker/build-push-action@v5
+      - name: Build and push image
+        uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: linux/arm64
           push: true
+          provenance: false
+          sbom: false
           build-args: |
             XMX=${{ inputs.xmx }}
           tags: |
-            ${{ env.ECR_REGISTRY }}/isums/${{ inputs.service_name }}:latest
-            ${{ env.ECR_REGISTRY }}/isums/${{ inputs.service_name }}:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/${{ steps.meta.outputs.repository }}:latest
+            ${{ env.ECR_REGISTRY }}/${{ steps.meta.outputs.repository }}:${{ github.sha }}
           cache-from: type=gha,scope=${{ inputs.service_name }}
           cache-to: type=gha,mode=max,scope=${{ inputs.service_name }}
 
-      - name: Delete untagged ECR images
+      - name: Prune old tagged ECR images
+        if: ${{ inputs.ecr_keep_tagged > 0 }}
+        shell: bash
         run: |
-          IMAGE_IDS=$(aws ecr list-images \
-            --repository-name isums/${{ inputs.service_name }} \
-            --filter tagStatus=UNTAGGED \
-            --query 'imageIds[*]' \
-            --output json)
+          set -euo pipefail
+          repo='${{ steps.meta.outputs.repository }}'
+          keep='${{ inputs.ecr_keep_tagged }}'
 
-          if [ "$IMAGE_IDS" != "[]" ] && [ -n "$IMAGE_IDS" ]; then
-            aws ecr batch-delete-image \
-              --repository-name isums/${{ inputs.service_name }} \
-              --image-ids "$IMAGE_IDS"
-            echo "Cleaned up untagged images"
+          aws ecr describe-images \
+            --repository-name "$repo" \
+            --filter tagStatus=TAGGED \
+            --query 'sort_by(imageDetails,& imagePushedAt)[].{digest:imageDigest,tags:imageTags,pushed:imagePushedAt}' \
+            --output json > images.json
+
+          jq -r --argjson keep "$keep" '
+            [ .[] | select((.tags // []) | index("latest") | not) ]
+            | if length > $keep then .[0:(length - $keep)] else [] end
+            | .[].digest
+          ' images.json > delete-digests.txt
+
+          if [ -s delete-digests.txt ]; then
+            jq -R '{imageDigest: .}' delete-digests.txt | jq -s '.' > delete-images.json
+            aws ecr batch-delete-image --repository-name "$repo" --image-ids file://delete-images.json
           else
-            echo "No untagged images to clean"
+            echo "No old tagged images to prune"
           fi
 
-  # ─────────────────────────────────────────────
-  # JOB 3: Deploy to ECS
-  # ─────────────────────────────────────────────
   deploy:
     name: Deploy to ECS
     runs-on: ubuntu-latest
     needs: build-image
     environment: production
-
     steps:
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Download existing task definition
+      - name: Download task definition
+        shell: bash
         run: |
+          set -euo pipefail
           aws ecs describe-task-definition \
-            --task-definition ${{ inputs.service_name }} \
+            --task-definition '${{ needs.build-image.outputs.task-definition }}' \
             --query taskDefinition \
-            --output json > task-def.json
-          echo "Task definition downloaded"
+            --output json > task-def.raw.json
 
-      - name: Update image in task definition
+          jq 'del(
+            .taskDefinitionArn,
+            .revision,
+            .status,
+            .requiresAttributes,
+            .compatibilities,
+            .registeredAt,
+            .registeredBy,
+            .deregisteredAt
+          )' task-def.raw.json > task-def.json
+
+      - name: Render task definition
         id: task-def
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
           task-definition: task-def.json
-          container-name: ${{ inputs.service_name }}
+          container-name: ${{ needs.build-image.outputs.container-name }}
           image: ${{ needs.build-image.outputs.image }}
 
-      - name: Deploy to ECS
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+      - name: Deploy task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
           task-definition: ${{ steps.task-def.outputs.task-definition }}
           service: ${{ inputs.service_name }}
-          cluster: ${{ env.ECS_CLUSTER }}
-          wait-for-service-stability: true
+          cluster: ${{ inputs.ecs_cluster }}
+          wait-for-service-stability: ${{ inputs.wait_for_service_stability }}
 
-      - name: Update Service Connect configuration
+      - name: Verify ECS service
+        shell: bash
         run: |
-          if [ -n "${{ inputs.service_connect_services }}" ]; then
-            # Server mode - has gRPC or HTTP ports to expose
-            SERVICE_CONNECT_CONFIG=$(cat <<EOF
-          {
-            "enabled": true,
-            "namespace": "isums.local",
-            "services": ${{ inputs.service_connect_services }}
-          }
-          EOF
-            )
-          else
-            # Client only mode
-            SERVICE_CONNECT_CONFIG='{"enabled": true, "namespace": "isums.local"}'
-          fi
-
-          aws ecs update-service \
-            --cluster ${{ env.ECS_CLUSTER }} \
-            --service ${{ inputs.service_name }} \
-            --service-connect-configuration "$SERVICE_CONNECT_CONFIG"
-
-          echo "✅ Service Connect updated for ${{ inputs.service_name }}"
-
-      - name: Verify deployment
-        run: |
-          echo "✅ ${{ inputs.service_name }} deployed successfully at $(date)"
           aws ecs describe-services \
-            --cluster ${{ env.ECS_CLUSTER }} \
-            --services ${{ inputs.service_name }} \
-            --query 'services[0].{Status:status,Running:runningCount,Desired:desiredCount}' \
+            --cluster '${{ inputs.ecs_cluster }}' \
+            --services '${{ inputs.service_name }}' \
+            --query 'services[0].{Status:status,Running:runningCount,Desired:desiredCount,TaskDefinition:taskDefinition}' \
             --output table
-
-  # ─────────────────────────────────────────────
-  # JOB 4: Cleanup old GHA cache
-  # ─────────────────────────────────────────────
-  cleanup:
-    name: Cleanup old GHA cache
-    runs-on: ubuntu-latest
-    needs: deploy
-    if: always()
-    permissions:
-      actions: write
-      contents: read
-
-    steps:
-      - name: Delete stale caches older than 3 days
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const caches = await github.rest.actions.getActionsCacheList({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-            });
-
-            const threeDaysAgo = new Date();
-            threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
-
-            for (const cache of caches.data.actions_caches) {
-              const lastAccessed = new Date(cache.last_accessed_at);
-              if (lastAccessed < threeDaysAgo) {
-                await github.rest.actions.deleteActionsCacheById({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  cache_id: cache.id,
-                });
-                console.log(`Deleted cache: ${cache.key} (last accessed: ${cache.last_accessed_at})`);
-              }
-            }
