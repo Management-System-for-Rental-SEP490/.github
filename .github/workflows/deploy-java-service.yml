@@ -41,7 +41,7 @@ on:
       wait_for_service_stability:
         required: false
         type: boolean
-        default: true
+        default: false
       ecr_keep_tagged:
         required: false
         type: number
